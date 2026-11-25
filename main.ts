@@ -77,6 +77,6 @@ writeFileSync(
 );
 
 process.stdout.write(
-  `token radar: ${radar.board.rows.length} pre-token rows, watchlist ${radar.watchlist_total}/${radar.watchlist_total}, ` +
-    `multiple ${radar.calibration.global_multiple.toFixed(4)}x from ${radar.calibration.live_sample_count} live protocols\n`,
+  `token radar: ${radar.board.rows.length} pre-token rows, watchlist ${radar.watchlist_size}/${radar.watchlist_size}, ` +
+    `multiple ${radar.calibration.global_multiple.toFixed(4)}x from ${radar.calibration.live_samples} live protocols\n`,
 );

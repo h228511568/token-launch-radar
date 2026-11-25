@@ -1,12 +1,18 @@
 // The token launch radar model (radar-2), written for the make.fun token-radar-01 entry.
 //
 // One sealed snapshot of the DefiLlama protocol index goes in; a ranked board of pre-token
-// protocols comes out. The ranking multiple is not a constant anyone picked: it is calibrated
-// from the snapshot itself, as the median market-cap / TVL ratio of the protocols in the same
-// snapshot that already have a token. Category medians win when a category has enough live
+// protocols comes out. A protocol counts as pre-token only when the snapshot has no token
+// on record for it at all: no market cap, no symbol, no CoinGecko id. Plenty of famous
+// protocols carry a symbol but no priced market cap in the index; they launched already
+// and are not farm targets, so the symbol check is the one that keeps the board honest.
+//
+// The ranking multiple is not a constant anyone picked: it is calibrated from the snapshot
+// itself, as the median market-cap / TVL ratio of the live-token protocols in the same
+// snapshot (exchange tokens excluded; their "TVL" is custodial reserves, not protocol
+// value). A category's own median prices its rows when the category has at least four live
 // samples; the global median is the fallback. Wrapped, staked and bridged forms of someone
-// else's asset are never ranked, for the same reason the snapshot's own watchlist skips them:
-// their token already exists, so there is nothing to launch.
+// else's asset are never ranked, for the same reason the snapshot's own watchlist skips
+// them: their token already exists, so there is nothing to launch.
 //
 // Everything here is deterministic: no clock, no randomness, no network. The same snapshot
 // always produces the same board, byte for byte.
@@ -17,9 +23,11 @@ export interface Protocol {
   category: string;
   chains: string[];
   tvlUsd: number;
+  /** Seven-day TVL change, in percent (the snapshot's own unit). */
   change7d: number | null;
   mcapUsd: number | null;
   listedAt: string | null;
+  geckoId: string | null;
   symbol: string | null;
 }
 
@@ -34,23 +42,38 @@ export interface Snapshot {
 export interface BoardRow {
   rank: number;
   slug: string;
+  watchlist: boolean;
   name: string;
   category: string;
   chains: string[];
   tvl_usd: number;
   change_7d: number | null;
-  age_days: number;
-  multiple: number;
-  multiple_source: string;
+  mcap_usd: number | null;
+  listed_at: string | null;
+  gecko_id: string | null;
+  symbol: string | null;
+  token_status: string;
+  age_days: number | null;
+  implied_value_usd: number;
+  farm_score: number;
+  model: {
+    base_multiple: number;
+    growth_pct: number | null;
+    growth_multiplier: number;
+    maturity_multiplier: number;
+    chain_multiplier: number;
+    age_days: number | null;
+  };
+  farm_steps: string[];
+}
+
+export interface RadarRow extends BoardRow {
+  capital_usd: number;
+  hold_days: number;
+  base_multiple: number;
   growth_multiplier: number;
   maturity_multiplier: number;
   chain_multiplier: number;
-  implied_value_usd: number;
-  farm_capital_usd: number;
-  farm_hold_days: number;
-  farm_score: number;
-  farm_steps: string[];
-  watchlist: boolean;
 }
 
 export interface LiveRow {
@@ -61,15 +84,16 @@ export interface LiveRow {
   chains: string[];
   tvl_usd: number;
   mcap_usd: number;
-  ratio: number;
   change_7d: number | null;
-  age_days: number;
+  ratio: number;
+  age_days: number | null;
 }
 
 export interface Calibration {
   global_multiple: number;
-  live_sample_count: number;
-  category_multiples: { category: string; multiple: number; samples: number }[];
+  live_samples: number;
+  multiples: Record<string, number>;
+  category_samples: Record<string, number>;
 }
 
 export interface Board {
@@ -81,16 +105,20 @@ export interface Board {
 
 export interface Radar {
   board: Board;
+  rows: RadarRow[];
   live: LiveRow[];
   calibration: Calibration;
-  watchlist_total: number;
-  pre_token_total: number;
-  early_rows: number;
+  watchlist_size: number;
+  early_size: number;
 }
 
 export const MODEL_VERSION = 'radar-2';
+export const MODEL_FORMULA =
+  'implied = TVL x base multiple (category median of live mcap/TVL, global median as fallback) ' +
+  'x growth (7d TVL change, clamped, half weight) x maturity (age without a token) x chains';
 
 const DAY_MS = 86_400_000;
+const UNKNOWN_AGE_DAYS = 365;
 
 /** Parse and normalize the sealed snapshot; throws on anything malformed. */
 export function parseSnapshot(text: string): Snapshot {
@@ -112,6 +140,7 @@ export function parseSnapshot(text: string): Snapshot {
       change7d: typeof p.change_7d === 'number' ? p.change_7d : null,
       mcapUsd: typeof p.mcap_usd === 'number' ? p.mcap_usd : null,
       listedAt: typeof p.listed_at === 'string' ? p.listed_at : null,
+      geckoId: typeof p.gecko_id === 'string' ? p.gecko_id : null,
       symbol: typeof p.symbol === 'string' ? p.symbol : null,
     };
   });
@@ -124,13 +153,28 @@ export function parseSnapshot(text: string): Snapshot {
   };
 }
 
-/** Whole days between a protocol's listing date and the snapshot date; 0 when unknown. */
-export function ageDays(p: Protocol, asOf: string): number {
-  if (p.listedAt === null) return 0;
+/** Pre-token means no token on record at all: no market cap, no symbol, no CoinGecko id. */
+export function isPreToken(p: Protocol): boolean {
+  return p.mcapUsd === null && p.symbol === null && p.geckoId === null;
+}
+
+/** Whole days between listing and the snapshot date; null when the listing date is unknown. */
+export function ageDays(p: Protocol, asOf: string): number | null {
+  if (p.listedAt === null) return null;
   const listed = Date.parse(p.listedAt);
   const snap = Date.parse(asOf);
-  if (Number.isNaN(listed) || Number.isNaN(snap) || snap < listed) return 0;
+  if (Number.isNaN(listed) || Number.isNaN(snap) || snap < listed) return null;
   return Math.floor((snap - listed) / DAY_MS);
+}
+
+/** The age the model scores with: an unknown listing date counts as one year of history. */
+export function effectiveAge(p: Protocol, asOf: string): number {
+  return ageDays(p, asOf) ?? UNKNOWN_AGE_DAYS;
+}
+
+/** Multiples are quoted at four decimals, the precision the board publishes and scores with. */
+function round4(v: number): number {
+  return Math.round(v * 10_000) / 10_000;
 }
 
 function median(values: number[]): number {
@@ -145,13 +189,14 @@ const CATEGORY_MIN_SAMPLES = 4;
 
 /**
  * Calibrate the implied-value multiple from the snapshot's own live-token protocols.
- * Ratios outside [0.02, 20] are data errors and meme outliers; they teach the model nothing.
+ * Ratios outside [0.02, 20] are data errors and meme outliers; exchange tokens are
+ * excluded because an exchange's TVL is custodial reserves, not protocol value.
  */
 export function calibrate(snapshot: Snapshot): Calibration {
   const byCategory = new Map<string, number[]>();
   const all: number[] = [];
   for (const p of snapshot.protocols) {
-    if (p.mcapUsd === null || p.tvlUsd <= 0) continue;
+    if (p.mcapUsd === null || p.tvlUsd <= 0 || p.category === 'CEX') continue;
     const ratio = p.mcapUsd / p.tvlUsd;
     if (ratio < RATIO_MIN || ratio > RATIO_MAX) continue;
     all.push(ratio);
@@ -159,14 +204,20 @@ export function calibrate(snapshot: Snapshot): Calibration {
     list.push(ratio);
     byCategory.set(p.category, list);
   }
-  const categoryMultiples = [...byCategory.entries()]
-    .filter(([, ratios]) => ratios.length >= CATEGORY_MIN_SAMPLES)
-    .map(([category, ratios]) => ({ category, multiple: median(ratios), samples: ratios.length }))
-    .sort((a, b) => a.category.localeCompare(b.category));
+  const multiples: Record<string, number> = {};
+  const categorySamples: Record<string, number> = {};
+  for (const category of [...byCategory.keys()].sort()) {
+    const ratios = byCategory.get(category)!;
+    if (ratios.length >= CATEGORY_MIN_SAMPLES) {
+      multiples[category] = round4(median(ratios));
+      categorySamples[category] = ratios.length;
+    }
+  }
   return {
-    global_multiple: all.length > 0 ? median(all) : 0,
-    live_sample_count: all.length,
-    category_multiples: categoryMultiples,
+    global_multiple: all.length > 0 ? round4(median(all)) : 0,
+    live_samples: all.length,
+    multiples,
+    category_samples: categorySamples,
   };
 }
 
@@ -183,9 +234,9 @@ const PRODUCT_FORM_WORDS = /\b(wrapped|staked|staking)\b/i;
 
 const EXCHANGE_PREFIXES = ['Binance', 'Coinbase', 'Bybit', 'Kraken', 'Bitget', 'OKX', 'Bitfinex', 'Gemini'];
 
-/** A name that is just another asset with a version tag, e.g. a v2 or 0-suffixed wrapper token. */
+/** A name that is just another asset with a version tag: a trailing v2, or a ticker ending in 0. */
 function hasVersionSuffix(name: string): boolean {
-  return /\bv\d+$/i.test(name) || /\s\d+$/.test(name) === false && /[a-z]0$/i.test(name);
+  return /\bv\d+$/i.test(name) || /^[a-z]+0$/i.test(name);
 }
 
 /**
@@ -202,8 +253,8 @@ export function isProductForm(p: Protocol): boolean {
   return false;
 }
 
-const GROWTH_FLOOR = -0.6;
-const GROWTH_CAP = 1.2;
+const GROWTH_FLOOR_PCT = -60;
+const GROWTH_CAP_PCT = 120;
 const GROWTH_WEIGHT = 0.5;
 const MATURITY_BASE = 0.6;
 const MATURITY_SPAN = 0.4;
@@ -211,9 +262,10 @@ const MATURITY_FULL_DAYS = 1095;
 const CHAIN_STEP = 0.03;
 const CHAIN_MAX_EXTRA = 4;
 
-export function growthMultiplier(change7d: number | null): number {
-  if (change7d === null) return 1;
-  const clamped = Math.min(GROWTH_CAP, Math.max(GROWTH_FLOOR, change7d));
+/** The snapshot's change_7d is in percent; the model clamps it to [-60%, +120%] at half weight. */
+export function growthMultiplier(changePct: number | null): number {
+  if (changePct === null) return 1;
+  const clamped = Math.min(GROWTH_CAP_PCT, Math.max(GROWTH_FLOOR_PCT, changePct)) / 100;
   return 1 + GROWTH_WEIGHT * clamped;
 }
 
@@ -225,10 +277,14 @@ export function chainMultiplier(chainCount: number): number {
   return 1 + CHAIN_STEP * Math.min(Math.max(chainCount - 1, 0), CHAIN_MAX_EXTRA);
 }
 
-/** Farm budget tiers: bigger, older protocols justify more capital and a longer hold. */
-export function farmBudget(p: Protocol, age: number): { capital: number; holdDays: number } {
-  const capital = p.tvlUsd >= 1_000_000_000 ? 150 : p.tvlUsd >= 250_000_000 ? 100 : p.tvlUsd >= 50_000_000 ? 50 : 25;
-  const holdDays = age >= 540 ? 45 : age >= 180 ? 30 : 21;
+/**
+ * Farm budget: bigger protocols justify more capital. The hold runs the other way from
+ * intuition: a protocol that has already run a year without a token is closer to launch,
+ * so the plan holds it for less time than a young one that needs a longer runway.
+ */
+export function farmBudget(tvlUsd: number, age: number): { capital: number; holdDays: number } {
+  const capital = tvlUsd >= 1_000_000_000 ? 150 : tvlUsd >= 100_000_000 ? 100 : 50;
+  const holdDays = age >= 365 ? 30 : age >= 180 ? 45 : 60;
   return { capital, holdDays };
 }
 
@@ -278,40 +334,81 @@ export function farmSteps(p: Protocol, capital: number, holdDays: number): strin
   ];
 }
 
+function round2(v: number): number {
+  return Math.round(v * 100) / 100;
+}
+
 function scoreRow(
   p: Protocol,
   snapshot: Snapshot,
   calibration: Calibration,
   watchlist: Set<string>,
-): BoardRow {
+): RadarRow {
   const age = ageDays(p, snapshot.asOf);
-  const categoryMultiple = calibration.category_multiples.find((c) => c.category === p.category);
-  const multiple = categoryMultiple ? categoryMultiple.multiple : calibration.global_multiple;
+  const effAge = effectiveAge(p, snapshot.asOf);
+  const categoryMultiple = calibration.multiples[p.category];
+  const baseMultiple = categoryMultiple ?? calibration.global_multiple;
   const growth = growthMultiplier(p.change7d);
-  const maturity = maturityMultiplier(age);
+  const maturity = maturityMultiplier(effAge);
   const chains = chainMultiplier(p.chains.length);
-  const implied = Math.round(p.tvlUsd * multiple * growth * maturity * chains);
-  const { capital, holdDays } = farmBudget(p, age);
+  const implied = Math.round(p.tvlUsd * baseMultiple * growth * maturity * chains);
+  const { capital, holdDays } = farmBudget(p.tvlUsd, effAge);
+  const model = {
+    base_multiple: baseMultiple,
+    growth_pct: p.change7d,
+    growth_multiplier: growth,
+    maturity_multiplier: maturity,
+    chain_multiplier: chains,
+    age_days: age,
+  };
   return {
     rank: 0,
     slug: p.slug,
+    watchlist: watchlist.has(p.slug),
     name: p.name,
     category: p.category,
     chains: p.chains,
     tvl_usd: Math.round(p.tvlUsd),
     change_7d: p.change7d,
+    mcap_usd: null,
+    listed_at: p.listedAt,
+    gecko_id: p.geckoId,
+    symbol: p.symbol,
+    token_status: 'pre-token',
     age_days: age,
-    multiple,
-    multiple_source: categoryMultiple ? `category median of ${categoryMultiple.samples}` : 'global median',
+    implied_value_usd: implied,
+    farm_score: round2(implied / (capital * holdDays)),
+    model,
+    farm_steps: farmSteps(p, capital, holdDays),
+    capital_usd: capital,
+    hold_days: holdDays,
+    base_multiple: baseMultiple,
     growth_multiplier: growth,
     maturity_multiplier: maturity,
     chain_multiplier: chains,
-    implied_value_usd: implied,
-    farm_capital_usd: capital,
-    farm_hold_days: holdDays,
-    farm_score: Math.round(implied / (capital * holdDays)),
-    farm_steps: farmSteps(p, capital, holdDays),
-    watchlist: watchlist.has(p.slug),
+  };
+}
+
+function toBoardRow(r: RadarRow): BoardRow {
+  return {
+    rank: r.rank,
+    slug: r.slug,
+    watchlist: r.watchlist,
+    name: r.name,
+    category: r.category,
+    chains: r.chains,
+    tvl_usd: r.tvl_usd,
+    change_7d: r.change_7d,
+    mcap_usd: r.mcap_usd,
+    listed_at: r.listed_at,
+    gecko_id: r.gecko_id,
+    symbol: r.symbol,
+    token_status: r.token_status,
+    age_days: r.age_days,
+    implied_value_usd: r.implied_value_usd,
+    farm_score: r.farm_score,
+    model: r.model,
+    farm_steps: r.farm_steps,
   };
 }
 
@@ -319,7 +416,7 @@ function scoreRow(
 export function buildRadar(snapshot: Snapshot): Radar {
   const calibration = calibrate(snapshot);
   const watchlist = new Set(snapshot.watchlist);
-  const rows: BoardRow[] = [];
+  const rows: RadarRow[] = [];
   const live: LiveRow[] = [];
   for (const p of snapshot.protocols) {
     if (p.mcapUsd !== null) {
@@ -331,12 +428,13 @@ export function buildRadar(snapshot: Snapshot): Radar {
         chains: p.chains,
         tvl_usd: Math.round(p.tvlUsd),
         mcap_usd: Math.round(p.mcapUsd),
-        ratio: p.tvlUsd > 0 ? p.mcapUsd / p.tvlUsd : 0,
         change_7d: p.change7d,
+        ratio: p.tvlUsd > 0 ? p.mcapUsd / p.tvlUsd : 0,
         age_days: ageDays(p, snapshot.asOf),
       });
       continue;
     }
+    if (!isPreToken(p)) continue;
     if (isProductForm(p)) continue;
     rows.push(scoreRow(p, snapshot, calibration, watchlist));
   }
@@ -348,14 +446,19 @@ export function buildRadar(snapshot: Snapshot): Radar {
   live.forEach((row, i) => {
     row.rank = i + 1;
   });
-  const board: Board = { as_of: snapshot.asOf, source: snapshot.source, model: MODEL_VERSION, rows };
+  const board: Board = {
+    as_of: snapshot.asOf,
+    source: snapshot.source,
+    model: MODEL_VERSION,
+    rows: rows.map(toBoardRow),
+  };
   return {
     board,
+    rows,
     live,
     calibration,
-    watchlist_total: snapshot.watchlist.length,
-    pre_token_total: rows.length,
-    early_rows: rows.filter((r) => !r.watchlist).length,
+    watchlist_size: snapshot.watchlist.length,
+    early_size: rows.filter((r) => !r.watchlist).length,
   };
 }
 
@@ -394,16 +497,18 @@ export function dataScript(radar: Radar): string {
   const payload = {
     as_of: radar.board.as_of,
     source: radar.board.source,
-    model: radar.board.model,
-    calibration: {
-      global_multiple: radar.calibration.global_multiple,
-      live_sample_count: radar.calibration.live_sample_count,
-      category_multiples: radar.calibration.category_multiples,
-    },
-    watchlist_total: radar.watchlist_total,
-    pre_token_total: radar.pre_token_total,
-    early_rows: radar.early_rows,
-    rows: radar.board.rows,
+    floor_usd: 50_000_000,
+    model: MODEL_FORMULA,
+    model_version: MODEL_VERSION,
+    watchlist_size: radar.watchlist_size,
+    board_size: radar.board.rows.length,
+    early_size: radar.early_size,
+    live_size: radar.live.length,
+    global_multiple: radar.calibration.global_multiple,
+    live_samples: radar.calibration.live_samples,
+    multiples: radar.calibration.multiples,
+    category_samples: radar.calibration.category_samples,
+    rows: radar.rows,
     live: radar.live,
   };
   return `window.TOKEN_RADAR_DATA = ${JSON.stringify(payload)};\n`;
